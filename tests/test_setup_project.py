@@ -36,6 +36,12 @@ class SetupProjectTests(unittest.TestCase):
         script = SETUP.read_text(encoding="utf-8")
         self.assertIn("$bootstrap = @(Find-BootstrapPython)", script)
 
+    def test_setup_validates_a_bootstrap_python_before_using_it(self):
+        script = SETUP.read_text(encoding="utf-8")
+        self.assertIn("function Test-BootstrapPython", script)
+        self.assertIn("import sys, venv", script)
+        self.assertIn("Test-BootstrapPython -File $python.Source", script)
+
     def test_readme_documents_secure_first_run_and_manual_auth_boundaries(self):
         text = README.read_text(encoding="utf-8")
         self.assertIn("初始化项目.cmd", text)

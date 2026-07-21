@@ -23,11 +23,21 @@ function Invoke-Checked {
     }
 }
 
+function Test-BootstrapPython {
+    param([string]$File, [string[]]$Arguments)
+    try {
+        & $File @Arguments '-c' 'import sys, venv; assert sys.version_info >= (3, 9)' *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function Find-BootstrapPython {
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($python) { return @($python.Source) }
+    if ($python -and (Test-BootstrapPython -File $python.Source -Arguments @())) { return @($python.Source) }
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($launcher) { return @($launcher.Source, '-3') }
+    if ($launcher -and (Test-BootstrapPython -File $launcher.Source -Arguments @('-3'))) { return @($launcher.Source, '-3') }
     throw 'Python 3 is required to create the project-local .venv. Install Python, then rerun 初始化项目.cmd.'
 }
 
