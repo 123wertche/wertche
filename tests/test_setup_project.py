@@ -42,6 +42,11 @@ class SetupProjectTests(unittest.TestCase):
         self.assertIn("import sys, venv", script)
         self.assertIn("Test-BootstrapPython -File $python.Source", script)
 
+    def test_setup_does_not_reverse_slice_a_single_bootstrap_command(self):
+        script = SETUP.read_text(encoding="utf-8")
+        self.assertIn("if ($bootstrap.Count -gt 1)", script)
+        self.assertIn("$bootstrap[1..($bootstrap.Count - 1)]", script)
+
     def test_readme_documents_secure_first_run_and_manual_auth_boundaries(self):
         text = README.read_text(encoding="utf-8")
         self.assertIn("初始化项目.cmd", text)

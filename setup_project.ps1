@@ -43,7 +43,8 @@ function Find-BootstrapPython {
 
 if (-not (Test-Path -LiteralPath $VenvPython) -and -not $CheckOnly) {
     $bootstrap = @(Find-BootstrapPython)
-    Invoke-Checked -File $bootstrap[0] -Arguments @($bootstrap[1..($bootstrap.Count - 1)] + @('-m', 'venv', (Join-Path $Root '.venv')))
+    $bootstrapArguments = if ($bootstrap.Count -gt 1) { @($bootstrap[1..($bootstrap.Count - 1)]) } else { @() }
+    Invoke-Checked -File $bootstrap[0] -Arguments @($bootstrapArguments + @('-m', 'venv', (Join-Path $Root '.venv')))
 }
 
 if ((Test-Path -LiteralPath $VenvPython) -and -not $CheckOnly) {
