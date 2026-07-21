@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "@larksuite/cli": "1.0.70"
+  }
+}

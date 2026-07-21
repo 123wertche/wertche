@@ -12,6 +12,8 @@ import download_bili_following_latest as bili
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CREATORS_PATH = ROOT / "douyin-creators.json"
 MANIFEST_ROOT = ROOT / "downloads" / "manifests"
+TARGET_VIDEO_TABLE_ID = "tblakZnkghpokyGT"
+REQUIRED_METRICS = ("播放量", "点赞数", "评论数", "转发数", "收藏数")
 
 
 CREATOR_FIELDS = {
@@ -41,6 +43,7 @@ VIDEO_FIELDS = {
         ],
     },
     "平台视频ID": {"type": "text", "name": "平台视频ID"},
+    "元数据文件路径": {"type": "text", "name": "元数据文件路径"},
     "内容去重状态": {
         "type": "select",
         "name": "内容去重状态",
@@ -53,6 +56,16 @@ VIDEO_FIELDS = {
         ],
     },
     "内容去重说明": {"type": "text", "name": "内容去重说明"},
+    "播放量": {"type": "number", "name": "播放量"},
+    "点赞数": {"type": "number", "name": "点赞数"},
+    "评论数": {"type": "number", "name": "评论数"},
+    "转发数": {"type": "number", "name": "转发数"},
+    "收藏数": {"type": "number", "name": "收藏数"},
+    "整体完播率": {"type": "number", "name": "整体完播率"},
+    "2秒跳出率": {"type": "number", "name": "2秒跳出率"},
+    "5秒完播率": {"type": "number", "name": "5秒完播率"},
+    "指标采集说明": {"type": "text", "name": "指标采集说明"},
+    "视频封面": {"type": "attachment", "name": "视频封面"},
 }
 
 
@@ -190,7 +203,11 @@ def load_creator_config(path):
     if not path.exists():
         return {}
     items = load_json(path)
-    return {item.get("key"): item for item in items if item.get("key")}
+    if isinstance(items, dict):
+        items = items.get("creators", [])
+    if not isinstance(items, list):
+        raise RuntimeError("Douyin creator config must be a list or an object with a creators list")
+    return {item.get("key"): item for item in items if isinstance(item, dict) and item.get("key")}
 
 
 def parsed_by_creator(manifest):
@@ -231,6 +248,8 @@ def build_items(download_manifest, creator_config):
             "speech_raw_path": transcript.get("speech_raw_path"),
             "speech_clean_path": transcript.get("speech_clean_path"),
             "speech_chars": transcript.get("speech_chars"),
+            "metrics": metadata.get("metrics") or {},
+            "metric_availability_note": metadata.get("metric_availability_note") or "",
         }
         items.append(item)
     return items
@@ -263,9 +282,20 @@ def load_videos(config):
         "BVID",
         "视频链接",
         "关联博主",
+        "博主",
         "平台",
         "平台视频ID",
         "内容去重状态",
+        "播放量",
+        "点赞数",
+        "评论数",
+        "转发数",
+        "收藏数",
+        "整体完播率",
+        "2秒跳出率",
+        "5秒完播率",
+        "指标采集说明",
+        "视频封面",
     ]
     table_id = config["tables"]["videos"]["table_id"]
     available = bili.field_names(config, table_id)
@@ -305,8 +335,15 @@ def creator_platforms(row, *, include_douyin=True):
 
 
 def has_link_to_creator(row, creator_record_id):
-    links = row.get("关联博主") or []
+    links = row.get("关联博主") or row.get("博主") or []
     return any(isinstance(link, dict) and link.get("id") == creator_record_id for link in links)
+
+
+def resolve_creator_link_field(video_fields):
+    for name in ("关联博主", "博主"):
+        if name in video_fields:
+            return name
+    raise RuntimeError("video table has neither 关联博主 nor 博主 link field")
 
 
 def find_existing_video(videos, item, creator_record_id):
@@ -338,6 +375,15 @@ def find_existing_video(videos, item, creator_record_id):
     if best_score >= 0.86:
         return "similar_title", best_row, best_score
     return None, best_row, best_score
+
+
+def should_update_existing_video(match_type):
+    return match_type == "same_platform_id"
+
+
+def required_metric_error(metrics):
+    missing = [name for name in REQUIRED_METRICS if not isinstance((metrics or {}).get(name), (int, float)) or isinstance((metrics or {}).get(name), bool)]
+    return f"基础指标数据不可用：{'、'.join(missing)}" if missing else ""
 
 
 def create_creator(config, item, *, dry_run=False):
@@ -408,13 +454,14 @@ def update_creator(config, creator, item, *, dry_run=False):
     return patch
 
 
-def create_video(config, item, creator, dedupe_status, dedupe_note, *, dry_run=False):
+def create_video(config, item, creator, dedupe_status, dedupe_note, video_fields, *, dry_run=False):
+    creator_link_field = resolve_creator_link_field(video_fields)
     fields = [
         "视频标题",
         "平台",
         "平台视频ID",
         "视频链接",
-        "关联博主",
+        creator_link_field,
         "发布时间",
         "时长秒",
         "视频文件路径",
@@ -430,6 +477,15 @@ def create_video(config, item, creator, dedupe_status, dedupe_note, *, dry_run=F
         "最近采集时间",
         "内容去重状态",
         "内容去重说明",
+        "播放量",
+        "点赞数",
+        "评论数",
+        "转发数",
+        "收藏数",
+        "整体完播率",
+        "2秒跳出率",
+        "5秒完播率",
+        "指标采集说明",
     ]
     has_transcript = bool(item.get("speech_clean_path"))
     row = [
@@ -453,6 +509,15 @@ def create_video(config, item, creator, dedupe_status, dedupe_note, *, dry_run=F
         now_str(),
         dedupe_status,
         dedupe_note[:1000],
+        item["metrics"].get("播放量"),
+        item["metrics"].get("点赞数"),
+        item["metrics"].get("评论数"),
+        item["metrics"].get("转发数"),
+        item["metrics"].get("收藏数"),
+        item["metrics"].get("整体完播率"),
+        item["metrics"].get("2秒跳出率"),
+        item["metrics"].get("5秒完播率"),
+        item.get("metric_availability_note") or "",
     ]
     if dry_run:
         return {"dry_run": True, "fields": fields, "row": row}
@@ -468,6 +533,76 @@ def create_video(config, item, creator, dedupe_status, dedupe_note, *, dry_run=F
     return record_ids[0]
 
 
+def update_video_metrics(config, record_id, item, *, dry_run=False):
+    has_transcript = bool(item.get("speech_clean_path"))
+    patch = {
+        "视频标题": item.get("title"),
+        "视频链接": item.get("video_url"),
+        "发布时间": item.get("published_at"),
+        "时长秒": item.get("duration"),
+        "视频文件路径": item.get("video_path"),
+        "元数据文件路径": item.get("metadata_path"),
+        "视频文案路径": item.get("description_path"),
+        "封面文件路径": item.get("cover_path"),
+        "音频文件路径": item.get("audio_path"),
+        "原始文案路径": item.get("speech_raw_path"),
+        "清洗文案路径": item.get("speech_clean_path"),
+        "视频下载状态": "已下载",
+        "音频状态": "已下载" if item.get("audio_path") else "跳过",
+        "转写状态": "已转写" if has_transcript else "无需转写",
+        "最近采集时间": now_str(),
+    }
+    patch.update({
+        name: item.get("metrics", {}).get(name)
+        for name in ("播放量", "点赞数", "评论数", "转发数", "收藏数", "整体完播率", "2秒跳出率", "5秒完播率")
+        if item.get("metrics", {}).get(name) is not None
+    })
+    if item.get("metric_availability_note"):
+        patch["指标采集说明"] = item["metric_availability_note"]
+    patch = {key: value for key, value in patch.items() if value is not None and value != ""}
+    if not patch or dry_run:
+        return patch
+    run_lark_with_json(config, config["tables"]["videos"]["table_id"], "+record-upsert", patch, record_id=record_id)
+    return patch
+
+
+def upload_cover_if_missing(config, record_id, row, cover_path, video_fields, *, dry_run=False):
+    if not cover_path or not Path(cover_path).is_file():
+        return "missing_local_cover"
+    if row.get("视频封面"):
+        return "already_has_attachment"
+    if dry_run:
+        return "would_upload"
+    field = video_fields.get("视频封面") or {}
+    field_id = field.get("field_id") or field.get("id")
+    if not field_id:
+        raise RuntimeError("视频封面 field id unavailable; refusing to upload attachment")
+    bili.run_lark(
+        config,
+        [
+            "+record-upload-attachment",
+            "--as", "user",
+            "--base-token", config["base_token"],
+            "--table-id", config["tables"]["videos"]["table_id"],
+            "--record-id", record_id,
+            "--field-id", field_id,
+            "--file", lark_relative_file(cover_path),
+        ],
+        timeout=180,
+    )
+    return "uploaded"
+
+
+def lark_relative_file(path):
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    try:
+        return str(candidate.resolve().relative_to(ROOT.resolve()))
+    except ValueError as exc:
+        raise RuntimeError("attachment must be inside the project directory") from exc
+
+
 def sync(args):
     started_at = now_str()
     download_manifest_path = Path(args.manifest) if args.manifest else latest_douyin_manifest()
@@ -480,11 +615,14 @@ def sync(args):
     config = bili.load_config()
     creators_table = config["tables"]["creators"]["table_id"]
     videos_table = config["tables"]["videos"]["table_id"]
+    if videos_table != TARGET_VIDEO_TABLE_ID:
+        raise RuntimeError(f"refusing to write unexpected video table {videos_table}; expected {TARGET_VIDEO_TABLE_ID}")
 
     created_fields = {
         "creators": ensure_fields(config, creators_table, CREATOR_FIELDS, dry_run=args.dry_run),
         "videos": ensure_fields(config, videos_table, VIDEO_FIELDS, dry_run=args.dry_run),
     }
+    video_fields = bili.field_names(config, videos_table)
 
     creators = load_creators(config)
     videos = load_videos(config)
@@ -505,6 +643,9 @@ def sync(args):
 
     for item in items:
         try:
+            metric_error = required_metric_error(item.get("metrics"))
+            if metric_error:
+                raise RuntimeError(metric_error)
             creator = find_creator(creators, item)
             if creator:
                 patch = update_creator(config, creator, item, dry_run=args.dry_run)
@@ -520,11 +661,15 @@ def sync(args):
                 result["created_creators"].append(
                     {"name": item["creator_name"], "record_id": creator.get("_record_id"), "url": item["creator_url"]}
                 )
-                if not args.dry_run:
-                    creators.append(creator)
+                # Keep planned state in memory during dry-run too, so repeated
+                # videos from one creator do not preview duplicate creators.
+                creators.append(creator)
 
             match_type, match_row, score = find_existing_video(videos, item, creator.get("_record_id"))
-            if match_type:
+            if should_update_existing_video(match_type):
+                metric_patch = update_video_metrics(config, match_row["_record_id"], item, dry_run=args.dry_run)
+                fresh_row = next((row for row in load_videos(config) if row.get("_record_id") == match_row["_record_id"]), match_row)
+                cover_status = upload_cover_if_missing(config, match_row["_record_id"], fresh_row, item.get("cover_path"), video_fields, dry_run=args.dry_run)
                 result["skipped_videos"].append(
                     {
                         "creator": item["creator_name"],
@@ -534,6 +679,8 @@ def sync(args):
                         "matched_record_id": match_row.get("_record_id"),
                         "matched_title": match_row.get("视频标题"),
                         "score": score,
+                        "metric_patch": metric_patch,
+                        "cover_status": cover_status,
                     }
                 )
                 continue
@@ -554,7 +701,17 @@ def sync(args):
                 continue
 
             dedupe_note = "抖音-only 博主，未找到相同 aweme_id 或同博主近似标题。"
-            record_id = create_video(config, item, creator, "确认独立", dedupe_note, dry_run=args.dry_run)
+            record_id = create_video(
+                config,
+                item,
+                creator,
+                "确认独立",
+                dedupe_note,
+                video_fields,
+                dry_run=args.dry_run,
+            )
+            fresh_row = next((row for row in load_videos(config) if row.get("_record_id") == record_id), {}) if not args.dry_run else {}
+            cover_status = upload_cover_if_missing(config, record_id, fresh_row, item.get("cover_path"), video_fields, dry_run=args.dry_run)
             result["created_videos"].append(
                 {
                     "creator": item["creator_name"],
@@ -562,6 +719,7 @@ def sync(args):
                     "aweme_id": item["aweme_id"],
                     "title": item["title"],
                     "video_url": item["video_url"],
+                    "cover_status": cover_status,
                 }
             )
             if not args.dry_run:

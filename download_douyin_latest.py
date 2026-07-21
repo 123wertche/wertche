@@ -11,7 +11,10 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+from douyin_metrics import extract_aweme_metrics
+from transcription_device import TranscriptionDeviceError, choose_device, is_gpu_failure, transcribe_with_fallback
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,13 +59,20 @@ def command_env():
     env.pop("HERMES_GIT_BASH_PATH", None)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    command_dirs = [
+        ROOT / ".venv" / "Scripts",
+        ROOT / ".venv" / "lark" / "node_modules" / ".bin",
+        Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin",
+    ]
+    env["PATH"] = os.pathsep.join(str(path) for path in command_dirs if path.exists()) + os.pathsep + env.get("PATH", "")
+    env.setdefault("DOUYIN_CHROME_USER_DATA_DIR", str(ROOT / "runtime" / "chrome-profile"))
     return env
 
 
 def normalize_command(args):
     if not args:
         return args
-    executable = shutil.which(args[0]) or args[0]
+    executable = shutil.which(args[0], path=command_env().get("PATH")) or args[0]
     suffix = Path(executable).suffix.lower()
     if suffix in {".cmd", ".bat"}:
         return ["cmd", "/c", executable, *args[1:]]
@@ -166,9 +176,13 @@ def ensure_cdp_bridge():
         parsed = urlparse(CDP_BRIDGE_URL)
         if parsed.port:
             env["DOUYIN_CDP_BRIDGE_PORT"] = str(parsed.port)
+        env["DOUYIN_CDP_PORT"] = str(CDP_PORT)
+        node_executable = shutil.which("node", path=env.get("PATH"))
+        if not node_executable:
+            raise RuntimeError("project Node executable not found") from first_error
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.Popen(
-            ["node", str(script)],
+            [node_executable, str(script)],
             cwd=ROOT,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -206,7 +220,24 @@ def cdp_run(steps, tab=None, timeout=90):
     tab_alias = tab
     result_steps = []
     for step in steps:
-        if "newTab" in step:
+        if "attachTab" in step:
+            spec = step["attachTab"]
+            url = spec.get("url") if isinstance(spec, dict) else str(spec)
+            opened = http_json(
+                f"{CDP_BRIDGE_URL}/attach",
+                {"url": url},
+                timeout=timeout,
+            )
+            tab_alias = f"t{NEXT_BRIDGE_TAB_ID}"
+            NEXT_BRIDGE_TAB_ID += 1
+            current = {
+                "targetId": opened["targetId"],
+                "sessionId": opened["sessionId"],
+                "owned": False,
+            }
+            BRIDGE_TABS[tab_alias] = current
+            result_steps.append({"action": "attachTab", "status": "ok", "output": opened})
+        elif "newTab" in step:
             spec = step["newTab"]
             if isinstance(spec, dict):
                 url = spec.get("url") or "about:blank"
@@ -227,6 +258,7 @@ def cdp_run(steps, tab=None, timeout=90):
             current = {
                 "targetId": opened["targetId"],
                 "sessionId": opened["sessionId"],
+                "owned": True,
             }
             BRIDGE_TABS[tab_alias] = current
             result_steps.append({"action": "newTab", "status": "ok", "output": opened})
@@ -261,7 +293,8 @@ def cdp_run(steps, tab=None, timeout=90):
             close_alias = step["closeTab"] if isinstance(step["closeTab"], str) else tab_alias
             target = BRIDGE_TABS.pop(close_alias, None) or current
             if target:
-                http_json(f"{CDP_BRIDGE_URL}/close", {"targetId": target["targetId"]}, timeout=timeout)
+                endpoint = "close" if target.get("owned", True) else "detach"
+                http_json(f"{CDP_BRIDGE_URL}/{endpoint}", {"targetId": target["targetId"], "sessionId": target["sessionId"]}, timeout=timeout)
             result_steps.append({"action": "closeTab", "status": "ok"})
         else:
             raise RuntimeError(f"Unsupported bridge CDP step: {step}")
@@ -270,6 +303,30 @@ def cdp_run(steps, tab=None, timeout=90):
 
 def new_tab_step(url):
     return {"newTab": {"url": url, "background": False}}
+
+
+def creator_tab_step(url):
+    return {"attachTab": {"url": url}}
+
+
+def creator_scroll_expression():
+    return """() => {
+        window.scrollTo(0, Math.min(document.body?.scrollHeight || 0, 1200));
+        return true;
+    }"""
+
+
+def creator_navigation_steps(url, *, reused):
+    if reused:
+        return [{"sleep": 500}]
+    return [
+        {"goto": url},
+        {"sleep": 8000},
+        {"pageFunction": creator_scroll_expression()},
+        {"sleep": 2500},
+        {"pageFunction": "() => window.scrollTo(0, 0) || true"},
+        {"sleep": 1000},
+    ]
 
 
 def unwrap_cdp_value(value):
@@ -336,6 +393,8 @@ def load_creators(args):
                 "url": url,
             }
         )
+    if args.max_creators:
+        creators = creators[: args.max_creators]
     return creators
 
 
@@ -412,6 +471,30 @@ def extract_sec_uid(url):
     return match.group(1) if match else ""
 
 
+def explicit_modal_selection(url):
+    parsed = urlparse(str(url or ""))
+    sec_uid = extract_sec_uid(url)
+    modal_id = (parse_qs(parsed.query).get("modal_id") or [""])[0]
+    if parsed.netloc.lower() not in {"douyin.com", "www.douyin.com"} or not sec_uid:
+        raise ValueError("--video-url must be a Douyin creator profile URL")
+    if not re.fullmatch(r"\d{15,25}", str(modal_id or "")):
+        raise ValueError("--video-url must contain a numeric modal_id")
+    creator = {
+        "key": f"explicit_{safe_name(sec_uid[-16:])}",
+        "name": "Douyin creator",
+        "url": f"https://www.douyin.com/user/{sec_uid}",
+        "sec_uid": sec_uid,
+        "source": "explicit_modal_url",
+    }
+    selected = {
+        "aweme_id": str(modal_id),
+        "video_url": str(url),
+        "is_pinned": False,
+        "selection_reason": "user_supplied_modal_url",
+    }
+    return creator, selected
+
+
 def load_existing_feishu_aweme_ids(args):
     if not args.from_feishu or not args.skip_existing_feishu:
         return set()
@@ -459,6 +542,43 @@ def clean_card_title(text):
     return lines[0] if lines else ""
 
 
+def extract_aweme_post_cards(payload, sec_uid):
+    cards = []
+    for aweme in (payload or {}).get("aweme_list") or []:
+        if not isinstance(aweme, dict):
+            continue
+        author = aweme.get("author") or {}
+        if str(author.get("sec_uid") or "") != str(sec_uid):
+            continue
+        aweme_id = str(aweme.get("aweme_id") or "")
+        if not aweme_id:
+            continue
+        video = aweme.get("video") or {}
+        duration = video.get("duration") if isinstance(video, dict) else None
+        if aweme.get("article_info") or aweme.get("aweme_type") == 163:
+            continue
+        if not isinstance(video, dict) or not video or (duration is not None and float(duration or 0) <= 0):
+            continue
+        cover = video.get("cover") or {}
+        cover_urls = cover.get("url_list") if isinstance(cover, dict) else None
+        cards.append(
+            {
+                "aweme_id": aweme_id,
+                "video_url": f"https://www.douyin.com/video/{aweme_id}",
+                "title": clean_card_title(aweme.get("desc") or ""),
+                "raw_text": aweme.get("desc") or "",
+                "cover_url": next((url for url in (cover_urls or []) if isinstance(url, str) and url.startswith("http")), ""),
+                "is_pinned": bool(aweme.get("is_top")),
+                "create_time": int(aweme.get("create_time") or 0),
+                "source": "aweme_post",
+            }
+        )
+    cards.sort(key=lambda card: card["create_time"], reverse=True)
+    for rank, card in enumerate(cards, start=1):
+        card["rank"] = rank
+    return cards
+
+
 def select_latest_cards(cards, limit):
     selected = []
     saw_pin_marker = any(card.get("is_pinned") for card in cards)
@@ -471,37 +591,100 @@ def select_latest_cards(cards, limit):
         selected.append(card)
         if len(selected) >= limit:
             return selected
-    for card in cards[:limit]:
-        card = dict(card)
-        card["selection_reason"] = "all_visible_candidates_marked_pinned"
-        selected.append(card)
     return selected
 
 
-def fetch_latest_cards(creator, limit):
+def choose_creator_candidates(official_cards, dom_cards):
+    return official_cards
+
+
+def load_recent_official_candidate_cache(creator, limit, *, max_age_seconds=24 * 60 * 60):
+    creator_url = str(creator.get("url") or "").split("?", 1)[0].rstrip("/")
+    if not creator_url or not MANIFEST_ROOT.exists():
+        return None
+    now = time.time()
+    paths = sorted(
+        MANIFEST_ROOT.glob("*-douyin-latest-download.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            if now - path.stat().st_mtime > max_age_seconds:
+                continue
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for parsed in manifest.get("parsed", []):
+            parsed_creator = parsed.get("creator") or {}
+            parsed_url = str(parsed_creator.get("url") or "").split("?", 1)[0].rstrip("/")
+            capture = parsed.get("aweme_post_capture") or {}
+            selected = [dict(item) for item in (parsed.get("selected") or []) if not item.get("is_pinned")]
+            if parsed_url != creator_url or not capture.get("captured") or not selected:
+                continue
+            result = dict(parsed)
+            result["creator"] = dict(creator)
+            result["selected"] = selected[:limit]
+            result["page_status"] = "live_unavailable_using_recent_official_cache"
+            result["cache_fallback"] = {
+                "used": True,
+                "source_manifest": str(path),
+                "captured_at": capture.get("captured_at"),
+            }
+            return result
+    return None
+
+
+def has_recent_creator_page_failure(creator, *, max_age_seconds=15 * 60):
+    creator_url = str(creator.get("url") or "").split("?", 1)[0].rstrip("/")
+    if not creator_url or not MANIFEST_ROOT.exists():
+        return False
+    now = time.time()
+    paths = sorted(
+        MANIFEST_ROOT.glob("*-douyin-latest-download.json"),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            if now - path.stat().st_mtime > max_age_seconds:
+                continue
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for failure in manifest.get("failures", []):
+            failed_url = str((failure.get("creator") or {}).get("url") or "").split("?", 1)[0].rstrip("/")
+            if failed_url == creator_url:
+                return True
+        for parsed in manifest.get("parsed", []):
+            parsed_url = str((parsed.get("creator") or {}).get("url") or "").split("?", 1)[0].rstrip("/")
+            if (
+                parsed_url == creator_url
+                and parsed.get("selected")
+                and (parsed.get("aweme_post_capture") or {}).get("captured")
+                and not (parsed.get("cache_fallback") or {}).get("used")
+            ):
+                return False
+    return False
+
+
+def fetch_latest_cards_once(creator, limit):
     tab = None
     try:
-        print(f"[parse] {creator['key']} opening Douyin homepage")
-        data = cdp_run([new_tab_step("https://www.douyin.com"), {"sleep": 2500}], timeout=90)
+        try:
+            print(f"[parse] {creator['key']} attaching visible creator page")
+            data = cdp_run([creator_tab_step(creator["url"])], timeout=30)
+        except Exception:
+            print(f"[parse] {creator['key']} opening Douyin homepage")
+            data = cdp_run([new_tab_step("https://www.douyin.com"), {"sleep": 2500}], timeout=90)
         tab = data.get("tab")
+        reused_tab = any(step.get("action") == "attachTab" for step in data.get("steps", []))
+        sec_uid = creator.get("sec_uid") or extract_sec_uid(creator.get("url"))
+        if not sec_uid:
+            raise RuntimeError("creator URL does not contain a Douyin sec_uid")
+        start_aweme_post_capture(tab, sec_uid)
         print(f"[parse] {creator['key']} opening creator page")
-        cdp_run(
-            [
-                {"goto": creator["url"]},
-                {"sleep": 8000},
-                {
-                    "pageFunction": """() => {
-                        window.scrollTo(0, Math.min(document.body.scrollHeight || 0, 1200));
-                        return true;
-                    }"""
-                },
-                {"sleep": 2500},
-                {"pageFunction": "() => window.scrollTo(0, 0) || true"},
-                {"sleep": 1000},
-            ],
-            tab=tab,
-            timeout=120,
-        )
+        cdp_run(creator_navigation_steps(creator["url"], reused=reused_tab), tab=tab, timeout=120)
         js_code = """() => {
             const absolutize = (href) => {
                 try { return new URL(href, location.href).href.split('?')[0]; }
@@ -573,6 +756,8 @@ def fetch_latest_cards(creator, limit):
         }"""
         data = cdp_run([{"pageFunction": js_code}], tab=tab, timeout=60)
         payload = page_function_value(data) or {}
+        captured = read_aweme_post_capture(tab)
+        official_cards = extract_aweme_post_cards((captured or {}).get("body") or {}, sec_uid)
         cards = payload.get("cards") or []
         cleaned = []
         for rank, card in enumerate(cards, start=1):
@@ -592,6 +777,7 @@ def fetch_latest_cards(creator, limit):
                     "source": card.get("source") or "unknown",
                 }
             )
+        cleaned = choose_creator_candidates(official_cards, cleaned)
         selected = select_latest_cards(cleaned, limit)
         return {
             "creator": creator,
@@ -599,16 +785,117 @@ def fetch_latest_cards(creator, limit):
             "page_title": payload.get("page_title") or "",
             "candidates": cleaned,
             "selected": selected,
+            "aweme_post_capture": {
+                "captured": bool(captured),
+                "status": (captured or {}).get("status"),
+                "captured_at": (captured or {}).get("captured_at"),
+                "official_candidate_count": len(official_cards),
+            },
         }
     finally:
         close_cdp_tab(tab)
 
 
-def fetch_video_metadata(video_url):
+def fetch_latest_cards(creator, limit, retry_delays=(2, 5, 10)):
+    if has_recent_creator_page_failure(creator):
+        cached = load_recent_official_candidate_cache(creator, limit)
+        if cached is not None:
+            cached["attempts"] = 0
+            cached["page_status"] = "recent_live_failure_using_official_cache"
+            cached["cache_fallback"]["reason"] = "recent_live_failure_circuit_breaker"
+            captured_at = cached["cache_fallback"].get("captured_at") or "unknown"
+            print(f"[warn] {creator['key']} recently exhausted live page retries; using official cache captured at {captured_at}")
+            return cached
+    last_result = None
+    last_error = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            result = fetch_latest_cards_once(creator, limit)
+            if result.get("selected"):
+                result["attempts"] = attempt + 1
+                return result
+            last_result = result
+            last_error = "creator page did not expose selectable video cards"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            print(f"[warn] {creator['key']} page/media unavailable; reopening in {delay}s ({attempt + 1}/{len(retry_delays)})")
+            time.sleep(delay)
+    cached = load_recent_official_candidate_cache(creator, limit)
+    if cached is not None:
+        cached["attempts"] = len(retry_delays) + 1
+        captured_at = (cached.get("cache_fallback") or {}).get("captured_at") or "unknown"
+        print(f"[warn] {creator['key']} live page unavailable; using recent official candidate cache captured at {captured_at}")
+        return cached
+    if last_result is not None:
+        last_result["attempts"] = len(retry_delays) + 1
+        last_result["page_status"] = "page_or_media_unavailable_after_retries"
+        return last_result
+    raise RuntimeError(f"page_or_media_unavailable_after_retries: {last_error}")
+
+
+def start_aweme_detail_capture(tab, aweme_id):
+    target = BRIDGE_TABS.get(tab)
+    if not target:
+        raise RuntimeError("aweme detail capture requires an open CDP tab")
+    return http_json(
+        f"{CDP_BRIDGE_URL}/aweme-detail/start",
+        {"sessionId": target["sessionId"], "awemeId": str(aweme_id)},
+        timeout=30,
+    )
+
+
+def start_aweme_post_capture(tab, sec_uid):
+    target = BRIDGE_TABS.get(tab)
+    if not target:
+        raise RuntimeError("creator post capture requires an attached CDP tab")
+    return http_json(
+        f"{CDP_BRIDGE_URL}/aweme-post/start",
+        {"sessionId": target["sessionId"], "secUserId": str(sec_uid)},
+        timeout=30,
+    )
+
+
+def read_aweme_detail_capture(tab, attempts=6, delay_seconds=1):
+    target = BRIDGE_TABS.get(tab)
+    if not target:
+        return None
+    for _ in range(attempts):
+        data = http_json(
+            f"{CDP_BRIDGE_URL}/aweme-detail/read",
+            {"sessionId": target["sessionId"]},
+            timeout=30,
+        )
+        if data.get("response"):
+            return data["response"]
+        time.sleep(delay_seconds)
+    return None
+
+
+def read_aweme_post_capture(tab, attempts=4, delay_seconds=1):
+    target = BRIDGE_TABS.get(tab)
+    if not target:
+        return None
+    for _ in range(attempts):
+        data = http_json(
+            f"{CDP_BRIDGE_URL}/aweme-post/read",
+            {"sessionId": target["sessionId"]},
+            timeout=30,
+        )
+        if data.get("response"):
+            return data["response"]
+        time.sleep(delay_seconds)
+    return None
+
+
+def fetch_video_metadata(video_url, aweme_id):
     tab = None
     try:
-        data = cdp_run([new_tab_step(video_url), {"sleep": 6500}], timeout=90)
+        data = cdp_run([new_tab_step("about:blank")], timeout=90)
         tab = data.get("tab")
+        start_aweme_detail_capture(tab, aweme_id)
+        cdp_run([{"goto": video_url}, {"sleep": 6500}], tab=tab, timeout=90)
         js_code = """() => {
             const meta = (name) => document.querySelector(`meta[name="${name}"]`)?.content || '';
             const prop = (name) => document.querySelector(`meta[property="${name}"]`)?.content || '';
@@ -624,9 +911,50 @@ def fetch_video_metadata(video_url):
             };
         }"""
         data = cdp_run([{"pageFunction": js_code}], tab=tab, timeout=60)
-        return page_function_value(data) or {}
+        page_meta = page_function_value(data) or {}
+        captured = read_aweme_detail_capture(tab)
+        if captured:
+            metric_result = extract_aweme_metrics(captured.get("body") or {}, aweme_id)
+            page_meta["aweme_detail_capture"] = {
+                "url": captured.get("url"),
+                "status": captured.get("status"),
+                "mime_type": captured.get("mime_type"),
+                "captured_at": captured.get("captured_at"),
+                "response_body": captured.get("body"),
+                **metric_result,
+            }
+        else:
+            page_meta["aweme_detail_capture"] = {
+                "values": {},
+                "source_paths": {},
+                "unavailable": [],
+                "availability_note": "数据不可用（未捕获到首次官方 aweme/detail 响应）",
+            }
+        return page_meta
     finally:
         close_cdp_tab(tab)
+
+
+def fetch_video_metadata_with_retry(video_url, aweme_id, retry_delays=(2, 5, 10), fetcher=None):
+    fetcher = fetcher or fetch_video_metadata
+    last_error = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            page_meta = fetcher(video_url, aweme_id)
+            capture = page_meta.get("aweme_detail_capture") or {}
+            if extract_aweme_stream(capture.get("response_body"), aweme_id):
+                return page_meta
+            last_error = "official aweme/detail response did not contain a usable video stream"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            print(
+                f"[warn] video {aweme_id} detail/media unavailable; reopening in {delay}s "
+                f"({attempt + 1}/{len(retry_delays)})"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"video detail/media unavailable after retries: {last_error}")
 
 
 def download_url(url, path):
@@ -644,13 +972,276 @@ def download_url(url, path):
 
 def download_direct(url, output_path, label):
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[download] {label}: {url[:90]}...")
+    host = urlparse(url).netloc or "unknown-host"
+    print(f"[download] {label} from {host}")
     request = urllib.request.Request(url, headers={"Referer": REFERER, "User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=90) as response, output_path.open("wb") as handle:
         shutil.copyfileobj(response, handle)
     if not output_path.exists() or output_path.stat().st_size <= 0:
         raise RuntimeError(f"downloaded empty {label} file: {output_path}")
     return output_path
+
+
+def extract_aweme_stream(payload, aweme_id):
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("aweme_detail")
+    if not isinstance(detail, dict) or str(detail.get("aweme_id") or "") != str(aweme_id):
+        return None
+    if detail.get("article_info") or detail.get("aweme_type") == 163:
+        return None
+    video = detail.get("video")
+    if not isinstance(video, dict):
+        return None
+    duration = video.get("duration")
+    if duration is not None and float(duration or 0) <= 0:
+        return None
+
+    candidates = []
+    for index, item in enumerate(video.get("bit_rate") or []):
+        if not isinstance(item, dict):
+            continue
+        play_addr = item.get("play_addr") or {}
+        urls = play_addr.get("url_list") if isinstance(play_addr, dict) else None
+        for url_index, url in enumerate(urls or []):
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            candidates.append(
+                {
+                    "video_url": url,
+                    "bit_rate": item.get("bit_rate") or 0,
+                    "width": item.get("width") or play_addr.get("width"),
+                    "height": item.get("height") or play_addr.get("height"),
+                    "source_path": f"$.aweme_detail.video.bit_rate[{index}].play_addr.url_list[{url_index}]",
+                    "is_cdn": urlparse(url).netloc.lower() != "www.douyin.com",
+                }
+            )
+
+    if not candidates:
+        play_addr = video.get("play_addr") or {}
+        urls = play_addr.get("url_list") if isinstance(play_addr, dict) else None
+        for url_index, url in enumerate(urls or []):
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            candidates.append(
+                {
+                    "video_url": url,
+                    "bit_rate": play_addr.get("data_size") or 0,
+                    "width": video.get("width") or play_addr.get("width"),
+                    "height": video.get("height") or play_addr.get("height"),
+                    "source_path": f"$.aweme_detail.video.play_addr.url_list[{url_index}]",
+                    "is_cdn": urlparse(url).netloc.lower() != "www.douyin.com",
+                }
+            )
+
+    if not candidates:
+        return None
+    selected = max(candidates, key=lambda item: (item["bit_rate"], item["is_cdn"]))
+    selected.pop("is_cdn", None)
+    return selected
+
+
+def extract_ssr_video_detail(encoded_state, aweme_id, expected_sec_uid=""):
+    """Read one exact video from Douyin's URL-encoded official SSR page state."""
+    if not isinstance(encoded_state, str) or not encoded_state:
+        return None
+    try:
+        root = json.loads(unquote(encoded_state))
+    except (ValueError, TypeError):
+        return None
+    app = root.get("app") if isinstance(root, dict) else None
+    detail = app.get("videoDetail") if isinstance(app, dict) else None
+    if not isinstance(detail, dict) or str(detail.get("awemeId") or "") != str(aweme_id):
+        return None
+    author = detail.get("authorInfo") if isinstance(detail.get("authorInfo"), dict) else {}
+    if expected_sec_uid and str(author.get("secUid") or "") != str(expected_sec_uid):
+        return None
+    return detail
+
+
+def _ssr_play_addr(value):
+    if isinstance(value, list):
+        urls = []
+        for item in value:
+            url = item.get("src") if isinstance(item, dict) else item
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                urls.append(url)
+        return {"url_list": urls}
+    if not isinstance(value, dict):
+        return {"url_list": []}
+    urls = []
+    for item in value.get("urlList") or []:
+        url = item.get("src") if isinstance(item, dict) else item
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            urls.append(url)
+    return {
+        "url_list": urls,
+        "width": value.get("width"),
+        "height": value.get("height"),
+        "data_size": value.get("dataSize"),
+    }
+
+
+def ssr_detail_to_aweme_payload(detail):
+    """Normalize official SSR camelCase fields to the aweme/detail schema we already consume."""
+    if not isinstance(detail, dict):
+        return {}
+    author = detail.get("authorInfo") if isinstance(detail.get("authorInfo"), dict) else {}
+    stats = detail.get("stats") if isinstance(detail.get("stats"), dict) else {}
+    video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+    normalized_stats = {}
+    for source_key, target_key in (
+        ("playCount", "play_count"),
+        ("diggCount", "digg_count"),
+        ("commentCount", "comment_count"),
+        ("shareCount", "share_count"),
+        ("collectCount", "collect_count"),
+        ("forwardCount", "forward_count"),
+    ):
+        value = stats.get(source_key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized_stats[target_key] = value
+    bit_rate = []
+    for item in video.get("bitRateList") or []:
+        if not isinstance(item, dict):
+            continue
+        bit_rate.append(
+            {
+                "bit_rate": item.get("bitRate") or 0,
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "play_addr": _ssr_play_addr(item.get("playAddr")),
+            }
+        )
+    tag = detail.get("tag") if isinstance(detail.get("tag"), dict) else {}
+    return {
+        "aweme_detail": {
+            "aweme_id": str(detail.get("awemeId") or ""),
+            "aweme_type": detail.get("awemeType"),
+            "desc": detail.get("desc") or "",
+            "create_time": detail.get("createTime"),
+            "author": {
+                "sec_uid": author.get("secUid") or "",
+                "uid": author.get("uid") or "",
+                "nickname": author.get("nickname") or "",
+            },
+            "statistics": normalized_stats,
+            "video": {
+                "duration": video.get("duration"),
+                "width": video.get("width"),
+                "height": video.get("height"),
+                "play_addr": _ssr_play_addr(video.get("playAddr")),
+                "bit_rate": bit_rate,
+                "cover": {
+                    "url_list": [
+                        url for url in (video.get("coverUrlList") or []) if isinstance(url, str)
+                    ]
+                },
+            },
+            "is_top": bool(tag.get("isTop", False)),
+        }
+    }
+
+
+def annotate_ssr_metric_result(metric_result, payload):
+    result = dict(metric_result or {})
+    notes = []
+    unavailable = result.get("unavailable") or []
+    if unavailable:
+        notes.append(
+            "、".join(str(label) for label in unavailable)
+            + "：数据不可用（官方 official SSR 首屏数据未提供）"
+        )
+    detail = payload.get("aweme_detail") if isinstance(payload, dict) else {}
+    stats = detail.get("statistics") if isinstance(detail, dict) else {}
+    if isinstance(stats, dict) and stats.get("play_count") == 0:
+        notes.append(
+            "播放量按官方 SSR 原值记录为 0；这可能表示抖音网页接口未公开真实播放量"
+        )
+    result["availability_note"] = "；".join(notes)
+    return result
+
+
+def fetch_ssr_video_metadata(video_url, aweme_id, expected_sec_uid, retry_delays=(2, 5, 10)):
+    """Fallback to the official first-render page state when aweme/detail was not emitted."""
+    last_error = "SSR page state was not found"
+    for attempt in range(len(retry_delays) + 1):
+        tab = None
+        try:
+            data = cdp_run([new_tab_step(video_url), {"sleep": 8000}], timeout=90)
+            tab = data.get("tab")
+            expression = f"""() => {{
+                const awemeId = {json.dumps(str(aweme_id))};
+                const scripts = [...document.scripts].map(node => node.textContent || '');
+                return scripts.find(text =>
+                    text.includes(awemeId) &&
+                    (text.includes('%22videoDetail%22') || text.includes('\\"videoDetail\\"'))
+                ) || '';
+            }}"""
+            data = cdp_run([{"pageFunction": expression}], tab=tab, timeout=60)
+            encoded_state = page_function_value(data) or ""
+            detail = extract_ssr_video_detail(encoded_state, aweme_id, expected_sec_uid)
+            if not detail:
+                raise RuntimeError("official SSR state did not match the requested video and creator")
+            payload = ssr_detail_to_aweme_payload(detail)
+            if not extract_aweme_stream(payload, aweme_id):
+                raise RuntimeError("official SSR state did not contain a usable video stream")
+            metric_result = annotate_ssr_metric_result(
+                extract_aweme_metrics(payload, aweme_id), payload
+            )
+            video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+            covers = video.get("coverUrlList") or []
+            return {
+                "page_url": video_url,
+                "title": detail.get("desc") or "",
+                "description": detail.get("desc") or "",
+                "cover_url": covers[0] if covers else "",
+                "official_source": "douyin_ssr_page_state",
+                "aweme_detail_capture": {
+                    "source_type": "official_ssr_fallback",
+                    "captured_at": now_str(),
+                    "response_body": payload,
+                    **metric_result,
+                },
+            }
+        except Exception as exc:
+            last_error = str(exc)
+        finally:
+            close_cdp_tab(tab)
+        if attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            print(f"[warn] video {aweme_id} SSR unavailable; reopening in {delay}s")
+            time.sleep(delay)
+    raise RuntimeError(f"official SSR fallback failed: {last_error}")
+
+
+def fetch_video_metadata_with_official_fallback(
+    video_url,
+    aweme_id,
+    creator,
+    *,
+    detail_fetcher=None,
+    ssr_fetcher=None,
+):
+    detail_fetcher = detail_fetcher or fetch_video_metadata_with_retry
+    ssr_fetcher = ssr_fetcher or fetch_ssr_video_metadata
+    try:
+        return detail_fetcher(video_url, aweme_id)
+    except Exception as detail_error:
+        sec_uid = creator.get("sec_uid") or extract_sec_uid(creator.get("url"))
+        if not sec_uid:
+            raise RuntimeError(
+                f"aweme/detail failed and SSR fallback has no creator sec_uid: {detail_error}"
+            ) from detail_error
+        modal_url = f"https://www.douyin.com/user/{sec_uid}?modal_id={aweme_id}"
+        print(f"[warn] video {aweme_id} aweme/detail unavailable; using official SSR fallback")
+        try:
+            return ssr_fetcher(modal_url, aweme_id, sec_uid)
+        except Exception as ssr_error:
+            raise RuntimeError(
+                "official video metadata unavailable from both aweme/detail and SSR: "
+                f"detail={detail_error}; ssr={ssr_error}"
+            ) from ssr_error
 
 
 def merge_streams(video_stream_path, audio_stream_path, output_path):
@@ -829,9 +1420,19 @@ def find_downloaded_video(video_dir):
     return max(candidates, key=lambda path: path.stat().st_size)
 
 
-def download_video(video_url, video_dir):
+def download_video(video_url, video_dir, *, captured_response_body=None, aweme_id=None):
     video_dir.mkdir(parents=True, exist_ok=True)
-    stream_info = extract_video_streams(video_url)
+    captured_stream = extract_aweme_stream(captured_response_body, aweme_id) if aweme_id else None
+    if captured_stream:
+        stream_info = {
+            "mode": "aweme_detail",
+            "audio_url": None,
+            "page_metadata": {},
+            "media_resources": [],
+            **captured_stream,
+        }
+    else:
+        stream_info = extract_video_streams(video_url)
     log_text = json.dumps(
         {
             "mode": stream_info["mode"],
@@ -920,33 +1521,23 @@ def transcribe_audio(audio_path, asr_dir, *, model, language, device, threads, i
     json_path = asr_dir / f"{audio_path.stem}.json"
     if txt_path.exists() and json_path.exists() and not force:
         return txt_path
-    args = [
-        "whisper",
-        str(audio_path),
-        "--model",
-        model,
-        "--device",
-        device,
-        "--fp16",
-        "True" if str(device).lower().startswith("cuda") else "False",
-        "--language",
-        language,
-        "--task",
-        "transcribe",
-        "--output_dir",
-        str(asr_dir),
-        "--output_format",
-        "all",
-        "--verbose",
-        "False",
-        "--condition_on_previous_text",
-        "False",
-    ]
-    if initial_prompt:
-        args.extend(["--initial_prompt", initial_prompt])
-    if threads:
-        args.extend(["--threads", str(threads)])
-    run_command(args, timeout=60 * 60 * 8)
+    decision = choose_device(device)
+    def run(selected_device):
+        args = ["whisper", str(audio_path), "--model", model, "--device", selected_device,
+                "--fp16", "True" if selected_device == "cuda" else "False", "--language", language,
+                "--task", "transcribe", "--output_dir", str(asr_dir), "--output_format", "all",
+                "--verbose", "False", "--condition_on_previous_text", "False"]
+        if initial_prompt:
+            args.extend(["--initial_prompt", initial_prompt])
+        if threads:
+            args.extend(["--threads", str(threads)])
+        try:
+            run_command(args, timeout=60 * 60 * 8)
+        except RuntimeError as exc:
+            raise TranscriptionDeviceError(str(exc), gpu_related=is_gpu_failure(str(exc))) from exc
+        return selected_device
+    _, final_decision = transcribe_with_fallback(run, decision)
+    print(f"Whisper device: {final_decision.selected}" + (" (CUDA failed, fell back to CPU)" if final_decision.fallback_used else ""))
     if not txt_path.exists():
         produced = list(asr_dir.glob("*.txt"))
         if produced:
@@ -1025,18 +1616,45 @@ def build_description(selected, page_meta):
     return "\n\n".join(pieces).strip() + ("\n" if pieces else "")
 
 
-def process_selected_video(creator, selected, out_root, args):
+def apply_verified_creator_identity(creator, page_meta):
+    capture = page_meta.get("aweme_detail_capture") if isinstance(page_meta, dict) else {}
+    payload = capture.get("response_body") if isinstance(capture, dict) else {}
+    detail = payload.get("aweme_detail") if isinstance(payload, dict) else {}
+    author = detail.get("author") if isinstance(detail, dict) else {}
+    verified_sec_uid = str(author.get("sec_uid") or "") if isinstance(author, dict) else ""
+    expected_sec_uid = str(creator.get("sec_uid") or extract_sec_uid(creator.get("url")) or "")
+    nickname = str(author.get("nickname") or "").strip() if isinstance(author, dict) else ""
+    if (
+        nickname
+        and verified_sec_uid
+        and verified_sec_uid == expected_sec_uid
+        and str(creator.get("name") or "").strip() in {"", "Douyin creator"}
+    ):
+        creator["name"] = nickname
+    return creator
+
+
+def process_selected_video(creator, selected, out_root, args, page_meta=None):
     aweme_id = selected["aweme_id"]
     video_dir = out_root / creator["key"] / aweme_id
     video_dir.mkdir(parents=True, exist_ok=True)
     started_at = now_str()
-    page_meta = fetch_video_metadata(selected["video_url"])
+    page_meta = page_meta or fetch_video_metadata_with_official_fallback(
+        selected["video_url"], aweme_id, creator
+    )
+    apply_verified_creator_identity(creator, page_meta)
     if page_meta.get("title") and not selected.get("title"):
         selected["title"] = clean_card_title(page_meta["title"])
     if page_meta.get("cover_url") and not selected.get("cover_url"):
         selected["cover_url"] = page_meta["cover_url"]
 
-    video_path, download_log, stream_info = download_video(selected["video_url"], video_dir)
+    capture = page_meta.get("aweme_detail_capture") or {}
+    video_path, download_log, stream_info = download_video(
+        selected["video_url"],
+        video_dir,
+        captured_response_body=capture.get("response_body"),
+        aweme_id=aweme_id,
+    )
     if stream_info.get("page_metadata"):
         page_meta = {**stream_info["page_metadata"], **{k: v for k, v in page_meta.items() if v}}
     cover_path = video_dir / "cover.jpg"
@@ -1067,6 +1685,9 @@ def process_selected_video(creator, selected, out_root, args):
             "media_resource_count": len(stream_info.get("media_resources") or []),
         },
         "duration_seconds": duration,
+        "metrics": (page_meta.get("aweme_detail_capture") or {}).get("values") or {},
+        "metric_source_paths": (page_meta.get("aweme_detail_capture") or {}).get("source_paths") or {},
+        "metric_availability_note": (page_meta.get("aweme_detail_capture") or {}).get("availability_note") or "",
         "files": {
             "video_path": str(video_path),
             "description_path": str(description_path),
@@ -1101,6 +1722,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Download latest videos from isolated Douyin creators.")
     parser.add_argument("--creators", default=str(DEFAULT_CREATORS_PATH), help="Path to douyin creators JSON.")
     parser.add_argument("--creator-url", action="append", help="Douyin creator homepage URL. Can be repeated.")
+    parser.add_argument(
+        "--video-url",
+        action="append",
+        help="Exact Douyin creator modal URL containing modal_id. Can be repeated.",
+    )
     parser.add_argument("--from-feishu", action="store_true", help="Load Douyin creators from Feishu 博主 table.")
     parser.add_argument("--max-creators", type=int, default=None)
     parser.add_argument(
@@ -1122,7 +1748,7 @@ def parse_args():
     group.add_argument("--skip-transcribe", action="store_true", help="Do not run Whisper.")
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--language", default="zh")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--initial-prompt", default="")
     parser.add_argument("--force", action="store_true", help="Regenerate audio/transcript even if present.")
@@ -1142,7 +1768,13 @@ def main():
         raise RuntimeError("--videos-per-creator must be >= 1")
     args.transcribe = bool(args.transcribe and not args.skip_transcribe)
 
-    creators = load_creators(args)
+    explicit_pairs = []
+    if args.video_url:
+        explicit_pairs = [explicit_modal_selection(url) for url in args.video_url]
+        creators_by_key = {creator["key"]: creator for creator, _ in explicit_pairs}
+        creators = list(creators_by_key.values())
+    else:
+        creators = load_creators(args)
     existing_aweme_ids = load_existing_feishu_aweme_ids(args)
     out_root = Path(args.out_root)
     if not out_root.is_absolute():
@@ -1165,7 +1797,61 @@ def main():
         "summary": {},
     }
 
-    for creator in creators:
+    if explicit_pairs:
+        for creator, item in explicit_pairs:
+            parsed = {
+                "creator": creator,
+                "page_url": item["video_url"],
+                "candidates": [item],
+                "selected": [item],
+                "page_status": "user_supplied_exact_modal_url",
+            }
+            manifest["parsed"].append(parsed)
+            try:
+                if item["aweme_id"] in existing_aweme_ids:
+                    manifest["skipped_existing"].append(
+                        {
+                            "creator": creator,
+                            "aweme_id": item["aweme_id"],
+                            "video_url": item["video_url"],
+                            "reason": "already_in_feishu",
+                            "dry_run": args.dry_run,
+                        }
+                    )
+                    print(f"[skip] {creator['key']} {item['aweme_id']} already in Feishu")
+                    continue
+                if args.dry_run:
+                    manifest["would_download"].append(
+                        {
+                            "creator": creator,
+                            "aweme_id": item["aweme_id"],
+                            "video_url": item["video_url"],
+                            "dry_run": True,
+                        }
+                    )
+                    print(f"[dry-run] {creator['key']} {item['aweme_id']} exact modal URL")
+                    continue
+                print(f"[ssr] {creator['key']} {item['aweme_id']}")
+                page_meta = fetch_ssr_video_metadata(
+                    item["video_url"], item["aweme_id"], creator["sec_uid"]
+                )
+                success = process_selected_video(creator, item, out_root, args, page_meta=page_meta)
+                manifest["successes"].append(success)
+                existing_aweme_ids.add(item["aweme_id"])
+                print(f"[done] {creator['key']} {item['aweme_id']} -> {success['video_path']}")
+            except Exception as exc:
+                manifest["failures"].append(
+                    {
+                        "creator": creator,
+                        "aweme_id": item["aweme_id"],
+                        "video_url": item["video_url"],
+                        "error": str(exc)[-3000:],
+                        "time": now_str(),
+                    }
+                )
+                print(f"[failed] {creator['key']} {item['aweme_id']}: {exc}")
+    else:
+      for creator in creators:
         try:
             parsed = fetch_latest_cards(creator, args.videos_per_creator)
             manifest["parsed"].append(parsed)

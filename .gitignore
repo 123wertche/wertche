@@ -15,13 +15,61 @@ lark-auth-qrcode.png
 
 # Runtime state
 .codex/
+.worktrees/
 .tmp-lark/
+runtime/
+tools/git/
+tools/node/
+tools/lark/node_modules/
+tools/PortableGit-*.7z.exe
+tools/node-v*-win-*.zip
 *.log
 *.err.log
+
+# JavaScript dependencies and build/test caches
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.next/
+.vite/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.tsbuildinfo
 
 # Downloaded media, transcripts, browser profiles, and smoke-test outputs
 downloads/
 bilibili-download-test/
+outputs/
+deliveries/
+exports/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+*.flv
+*.m4a
+*.mp3
+*.wav
+*.aac
+*.flac
+*.srt
+*.vtt
+*.ass
+*.lrc
+
+# Certificates, private keys, and local credential exports
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials*.json
+service-account*.json
 
 # OS/editor noise
 .DS_Store

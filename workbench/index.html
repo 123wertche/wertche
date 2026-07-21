@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 博主采集工作台</title>
+  <script>
+    if (window.location.protocol === "file:") {
+      window.location.replace("http://127.0.0.1:8765/");
+    }
+  </script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="app-header">
+      <div class="brand-block">
+        <span class="local-label">LOCAL WORKBENCH</span>
+        <h1>AI 博主采集工作台</h1>
+        <p>抖音 Douyin · B站 Bilibili · 飞书 Feishu</p>
+      </div>
+      <div class="header-actions">
+        <span class="service-state"><span class="status-dot" aria-hidden="true"></span>本地服务已连接</span>
+        <button id="refresh" class="quiet">刷新状态</button>
+      </div>
+    </header>
+
+    <div id="notice" role="status" aria-live="polite"></div>
+
+    <section class="status-strip" aria-label="工作台概况">
+      <div><span>支持平台</span><strong>抖音 + B站</strong></div>
+      <div><span>默认范围</span><strong>每位 2 条</strong></div>
+      <div><span>转写设备</span><strong>GPU 优先</strong></div>
+      <div><span>服务地址</span><strong class="mono">127.0.0.1</strong></div>
+    </section>
+
+    <div class="workspace-grid">
+      <div class="workspace-primary">
+        <section class="panel creator-panel">
+          <div class="section-heading">
+            <div><span class="section-index">01</span><div><h2>选择博主</h2><p>支持单选、多选和随时添加</p></div></div>
+            <span id="creator-count" class="count-badge"></span>
+          </div>
+
+          <label class="field-label" for="creator-urls">博主主页链接</label>
+          <div class="add-row">
+            <textarea id="creator-urls" rows="2" placeholder="粘贴抖音或 B站主页链接，每行一个" aria-describedby="creator-hint"></textarea>
+            <button id="add-creators">添加博主</button>
+          </div>
+          <p id="creator-hint" class="field-hint">自动识别平台并去重，不接受搜索结果页。</p>
+
+          <div class="filters" role="group" aria-label="平台筛选">
+            <div class="filter-group">
+              <button class="chip active" data-filter="all">全部</button>
+              <button class="chip" data-filter="抖音">抖音</button>
+              <button class="chip" data-filter="B站">B站</button>
+            </div>
+            <div class="selection-actions">
+              <button id="select-visible" class="text-button">选择当前</button>
+              <button id="clear-selection" class="text-button">取消全选</button>
+            </div>
+          </div>
+          <div id="creator-list" class="creator-list"></div>
+        </section>
+
+        <section class="panel settings-panel">
+          <div class="section-heading">
+            <div><span class="section-index">02</span><div><h2>运行设置</h2><p>已应用推荐默认值</p></div></div>
+          </div>
+          <div class="settings">
+            <label><span>每位博主视频数</span><input id="video-count" type="number" min="1" max="20" value="2"></label>
+            <label><span>转写模型</span><select id="model"><option value="small">small（推荐）</option><option value="medium">medium</option><option value="large-v3-turbo">large-v3-turbo</option></select></label>
+            <label><span>计算设备</span><select id="device"><option value="auto">GPU 优先，失败转 CPU</option><option value="cuda">仅 GPU</option><option value="cpu">仅 CPU</option></select></label>
+          </div>
+          <div class="toggles" role="group" aria-label="处理选项">
+            <label><input id="transcribe" type="checkbox" checked><span>下载后转写</span></label>
+            <label><input id="comments" type="checkbox" checked><span>同步评论</span></label>
+          </div>
+        </section>
+      </div>
+
+      <aside class="workspace-rail" aria-label="执行与结果">
+        <section class="panel run-card">
+          <div class="section-heading">
+            <div><span class="section-index">03</span><div><h2>一键执行</h2><p>先预览，确认后再写入飞书</p></div></div>
+          </div>
+          <ol class="pipeline-summary">
+            <li><span>1</span>环境预检与专用 Chrome/CDP</li>
+            <li><span>2</span>候选视频 dry-run</li>
+            <li><span>3</span>下载、转写与飞书同步</li>
+            <li><span>4</span>指标、封面、评论与导出</li>
+          </ol>
+          <button id="run-pipeline" class="primary">开始一键流程</button>
+          <p class="run-note">正式写入前只需确认一次。</p>
+        </section>
+
+        <section id="confirmation" class="panel confirm" hidden>
+          <h2>Dry-run 已通过</h2>
+          <p>输入确认词 <code id="confirmation-phrase"></code> 后继续写入飞书。</p>
+          <label class="field-label" for="confirmation-input">确认词</label>
+          <div class="confirm-row"><input id="confirmation-input" autocomplete="off" placeholder="输入确认词"><button id="confirm-pipeline">确认继续</button></div>
+        </section>
+
+        <section class="panel progress-card">
+          <div class="section-heading progress-heading">
+            <div><span class="section-index">04</span><div><h2>进度与结果</h2><p id="current-step">选择博主后开始</p></div></div>
+            <span id="pipeline-status" class="status-badge">尚未运行</span>
+          </div>
+          <div class="progress" aria-hidden="true"><div id="progress-bar"></div></div>
+          <pre id="pipeline-log" aria-label="流水线运行日志">运行日志会显示在这里。</pre>
+          <div id="result-links" class="result-links"></div>
+        </section>
+      </aside>
+    </div>
+
+    <details class="panel advanced">
+      <summary><span>高级工具与环境状态</span><span class="summary-hint">按需展开</span></summary>
+      <div id="health-cards" class="health"></div>
+      <div class="button-row"><button data-lifecycle="chrome" class="quiet">启动专用 Chrome</button><button data-lifecycle="bridge" class="quiet">启动 CDP bridge</button><button data-lifecycle="connection" class="quiet">检查连接</button><button data-action="preflight" class="quiet">飞书预检</button><button data-action="export_video_table" class="quiet">单独导出</button></div>
+      <h3>最近产物</h3><ul id="artifact-list"></ul>
+    </details>
+
+    <details class="danger"><summary>危险操作</summary><p>删除类操作保持禁用；当前版本只允许预览，不会清空飞书或本地业务数据。</p></details>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

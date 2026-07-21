@@ -1,12 +1,13 @@
-[
-  {
-    "key": "douyin_creator_1",
-    "name": "秋芝2046",
-    "url": "https://www.douyin.com/user/MS4wLjABAAAAwbbVuf1W2DdgRe0xCa0oxg1ZIHbzuiTzyjq3NcOVgBuu6qIidYlMYqbL3ZFY2swu"
-  },
-  {
-    "key": "douyin_creator_2",
-    "name": "Lala罐头",
-    "url": "https://www.douyin.com/user/MS4wLjABAAAAI2P_yBUDrjJccqUniIzrnsKv-4wl9mtiUbeXApqenH5fWzgyo9hEBV6GqKzKV334"
-  }
-]
+{
+  "creators": [
+    {
+      "url": "https://www.douyin.com/user/MS4wLjABAAAAUqJz-zvKubvbS4iPATUMV6Hl0U_fSjBgu-b-HgXNCGI"
+    },
+    {
+      "url": "https://www.douyin.com/user/MS4wLjABAAAA1WD_TKDbEkAqYGnCZSxJWn2UUOrym4YK8jeP5vnjEkidYK5QSg2d5DkvEjUyXlKb"
+    },
+    {
+      "url": "https://www.douyin.com/user/MS4wLjABAAAAunpkE2IXyHAxm4A24G5d1Cf5141pnZy8HwNR5f2-6pI_GYBVR-Pv23uFyfMPB_9I"
+    }
+  ]
+}

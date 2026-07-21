@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "creators": [
+    {
+      "local_id": "17f34484691a8298",
+      "platform": "抖音",
+      "platform_id": "MS4wLjABAAAA1WD_TKDbEkAqYGnCZSxJWn2UUOrym4YK8jeP5vnjEkidYK5QSg2d5DkvEjUyXlKb",
+      "homepage_url": "https://www.douyin.com/user/MS4wLjABAAAA1WD_TKDbEkAqYGnCZSxJWn2UUOrym4YK8jeP5vnjEkidYK5QSg2d5DkvEjUyXlKb",
+      "display_name": "抖音 MS4wLjABAAAA1WD_TKDbEkAqYGnCZSxJWn2UUOrym4YK8jeP5vnjEkidYK5QSg2d5DkvEjUyXlKb",
+      "enabled": true,
+      "source": "local",
+      "feishu_record_id": null
+    },
+    {
+      "local_id": "a3c7b3fa07c6ef80",
+      "platform": "抖音",
+      "platform_id": "MS4wLjABAAAAUqJz-zvKubvbS4iPATUMV6Hl0U_fSjBgu-b-HgXNCGI",
+      "homepage_url": "https://www.douyin.com/user/MS4wLjABAAAAUqJz-zvKubvbS4iPATUMV6Hl0U_fSjBgu-b-HgXNCGI",
+      "display_name": "抖音 MS4wLjABAAAAUqJz-zvKubvbS4iPATUMV6Hl0U_fSjBgu-b-HgXNCGI",
+      "enabled": true,
+      "source": "local",
+      "feishu_record_id": null
+    },
+    {
+      "local_id": "b0e232f9244bd3c0",
+      "platform": "抖音",
+      "platform_id": "MS4wLjABAAAAcDr1K5mxsxTtzDlCL-ayfe0-2w-_vxka6OP0rKv6AMAZ5lylStW2CKrV97Py9aGR",
+      "homepage_url": "https://www.douyin.com/user/MS4wLjABAAAAcDr1K5mxsxTtzDlCL-ayfe0-2w-_vxka6OP0rKv6AMAZ5lylStW2CKrV97Py9aGR",
+      "display_name": "抖音 MS4wLjABAAAAcDr1K5mxsxTtzDlCL-ayfe0-2w-_vxka6OP0rKv6AMAZ5lylStW2CKrV97Py9aGR",
+      "enabled": true,
+      "source": "local",
+      "feishu_record_id": null
+    },
+    {
+      "local_id": "051dec34be09bd11",
+      "platform": "抖音",
+      "platform_id": "MS4wLjABAAAAunpkE2IXyHAxm4A24G5d1Cf5141pnZy8HwNR5f2-6pI_GYBVR-Pv23uFyfMPB_9I",
+      "homepage_url": "https://www.douyin.com/user/MS4wLjABAAAAunpkE2IXyHAxm4A24G5d1Cf5141pnZy8HwNR5f2-6pI_GYBVR-Pv23uFyfMPB_9I",
+      "display_name": "抖音 MS4wLjABAAAAunpkE2IXyHAxm4A24G5d1Cf5141pnZy8HwNR5f2-6pI_GYBVR-Pv23uFyfMPB_9I",
+      "enabled": true,
+      "source": "local",
+      "feishu_record_id": null
+    },
+    {
+      "local_id": "02c759cc589f0372",
+      "platform": "抖音",
+      "platform_id": "MS4wLjABAAAAWVOtuQbG6YBQFXGNBW8jBrxZtxmoLL1cIU7G8EjxM2413yS9ahflCOzVseaB1XbV",
+      "homepage_url": "https://www.douyin.com/user/MS4wLjABAAAAWVOtuQbG6YBQFXGNBW8jBrxZtxmoLL1cIU7G8EjxM2413yS9ahflCOzVseaB1XbV",
+      "display_name": "抖音 MS4wLjABAAAAWVOtuQbG6YBQFXGNBW8jBrxZtxmoLL1cIU7G8EjxM2413yS9ahflCOzVseaB1XbV",
+      "enabled": true,
+      "source": "local",
+      "feishu_record_id": null
+    }
+  ]
+}

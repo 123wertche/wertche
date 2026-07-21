@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import download_bili_following_latest as base
+from transcription_device import TranscriptionDeviceError, choose_device, is_gpu_failure, transcribe_with_fallback
 
 
 ROOT = Path(__file__).resolve().parent
@@ -302,33 +303,23 @@ def transcribe_audio(audio_path, asr_dir, *, model, language, device, threads, i
     json_path = asr_dir / f"{audio_path.stem}.json"
     if txt_path.exists() and json_path.exists() and not force:
         return txt_path
-    args = [
-        "whisper",
-        str(audio_path),
-        "--model",
-        model,
-        "--device",
-        device,
-        "--fp16",
-        "True" if str(device).lower().startswith("cuda") else "False",
-        "--language",
-        language,
-        "--task",
-        "transcribe",
-        "--output_dir",
-        str(asr_dir),
-        "--output_format",
-        "all",
-        "--verbose",
-        "False",
-        "--condition_on_previous_text",
-        "False",
-    ]
-    if initial_prompt:
-        args.extend(["--initial_prompt", initial_prompt])
-    if threads:
-        args.extend(["--threads", str(threads)])
-    run_command(args, timeout=60 * 60 * 8)
+    decision = choose_device(device)
+    def run(selected_device):
+        args = ["whisper", str(audio_path), "--model", model, "--device", selected_device,
+                "--fp16", "True" if selected_device == "cuda" else "False", "--language", language,
+                "--task", "transcribe", "--output_dir", str(asr_dir), "--output_format", "all",
+                "--verbose", "False", "--condition_on_previous_text", "False"]
+        if initial_prompt:
+            args.extend(["--initial_prompt", initial_prompt])
+        if threads:
+            args.extend(["--threads", str(threads)])
+        try:
+            run_command(args, timeout=60 * 60 * 8)
+        except RuntimeError as exc:
+            raise TranscriptionDeviceError(str(exc), gpu_related=is_gpu_failure(str(exc))) from exc
+        return selected_device
+    _, final_decision = transcribe_with_fallback(run, decision)
+    print(f"Whisper device: {final_decision.selected}" + (" (CUDA failed, fell back to CPU)" if final_decision.fallback_used else ""))
     if not txt_path.exists():
         produced = list(asr_dir.glob("*.txt"))
         if produced:
@@ -727,7 +718,7 @@ def main():
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--language", default="zh")
     parser.add_argument("--initial-prompt", default="")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--max-videos", type=int)
     parser.add_argument("--bvid")

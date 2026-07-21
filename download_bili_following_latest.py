@@ -62,17 +62,31 @@ def command_env():
     env["LARK_CLI_NO_PROXY"] = "1"
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    command_dirs = [
+        ROOT / ".venv" / "Scripts",
+        ROOT / ".venv" / "lark" / "node_modules" / ".bin",
+        Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin",
+    ]
+    env["PATH"] = os.pathsep.join(str(path) for path in command_dirs if path.exists()) + os.pathsep + env.get("PATH", "")
     return env
 
 
 def normalize_command(args):
     if not args:
         return args
-    executable = shutil.which(args[0]) or args[0]
+    executable = shutil.which(args[0], path=command_env().get("PATH")) or args[0]
     suffix = Path(executable).suffix.lower()
     if suffix in {".cmd", ".bat"}:
         return ["cmd", "/c", executable, *args[1:]]
     return [executable, *args[1:]]
+
+
+def redact_command_args(args):
+    redacted = list(args)
+    for index, value in enumerate(redacted[:-1]):
+        if value in {"--base-token", "--app-secret", "--access-token"}:
+            redacted[index + 1] = "***"
+    return redacted
 
 
 def run_command(args, *, timeout=None, check=True):
@@ -90,7 +104,7 @@ def run_command(args, *, timeout=None, check=True):
     if check and result.returncode != 0:
         raise RuntimeError(
             "command failed\n"
-            f"args: {args}\n"
+            f"args: {redact_command_args(args)}\n"
             f"exit: {result.returncode}\n"
             f"stdout:\n{result.stdout[-2000:]}\n"
             f"stderr:\n{result.stderr[-2000:]}"
@@ -273,6 +287,57 @@ def load_creators(config, max_creators=None):
     if max_creators:
         creators = creators[:max_creators]
     return creators
+
+
+def load_local_bili_creators(path, *, root=ROOT):
+    if not path:
+        return {}
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as exc:
+        raise RuntimeError("creators JSON must stay inside the project root") from exc
+    if not resolved.is_file():
+        return {}
+    with resolved.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    creators = {}
+    for raw in payload.get("creators", []) if isinstance(payload, dict) else []:
+        if not isinstance(raw, dict) or raw.get("platform") != "B站" or raw.get("enabled", True) is not True:
+            continue
+        mid = str(raw.get("platform_id") or "").strip()
+        if not mid.isdigit():
+            continue
+        creators[mid] = {
+            "name": str(raw.get("display_name") or f"B站 {mid}"),
+            "mid": mid,
+            "space_url": f"https://space.bilibili.com/{mid}/video",
+            "record_id": str(raw.get("feishu_record_id") or "").strip() or None,
+        }
+    return creators
+
+
+def resolve_selected_creators(config, mids, creator_file, dry_run, *, rows=None, root=ROOT):
+    existing = rows if rows is not None else load_creators(config)
+    by_mid = {str(item.get("mid") or "").strip(): dict(item) for item in existing}
+    local = load_local_bili_creators(creator_file, root=root)
+    if not mids:
+        return list(existing)
+    selected = []
+    for mid_value in dict.fromkeys(str(value).strip() for value in mids):
+        if not mid_value.isdigit():
+            raise RuntimeError(f"invalid B站 MID: {mid_value}")
+        if mid_value in by_mid:
+            selected.append(by_mid[mid_value])
+            continue
+        if dry_run and mid_value in local:
+            selected.append({**local[mid_value], "missing_feishu_creator": True})
+            continue
+        raise RuntimeError(f"B站 MID {mid_value} 缺少飞书博主记录")
+    return selected
 
 
 def existing_bvids(config):
@@ -1137,9 +1202,12 @@ def precheck(config):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--videos-per-creator", type=int, default=3)
+    parser.add_argument("--creator-mid", action="append", help="Only process selected Bilibili MID. Can be repeated.")
+    parser.add_argument("--creators-json", default=None, help="Project-local unified creator JSON used for dry-run previews.")
     parser.add_argument("--max-creators", type=int, default=None)
     parser.add_argument("--max-total-videos", type=int, default=None)
     parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--dry-run", action="store_true", help="List latest candidate videos without downloading media or writing Feishu.")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--comment-limit", type=int, default=50, help="Max top-level comments to fetch per new video.")
     parser.add_argument("--skip-comments", action="store_true", help="Do not fetch Bilibili comment content.")
@@ -1156,6 +1224,8 @@ def main():
         help="Date used with --only-today, in YYYY-MM-DD. Defaults to today's local date.",
     )
     args = parser.parse_args()
+    if args.dry_run and args.enrich_existing:
+        parser.error("--dry-run cannot be combined with --enrich-existing")
 
     run_started_perf = time.perf_counter()
     started_at = now_str()
@@ -1174,6 +1244,8 @@ def main():
         "failures": [],
         "created_record_ids": [],
         "created_snapshot_record_ids": [],
+        "dry_run": args.dry_run,
+        "dry_run_candidates": [],
         "only_today": args.only_today,
         "target_date": target_date if args.only_today else None,
         "comment_limit": 0 if args.skip_comments else args.comment_limit,
@@ -1195,7 +1267,8 @@ def main():
 
     precheck_started = time.perf_counter()
     precheck(config)
-    ensure_video_fields(config)
+    if not args.dry_run:
+        ensure_video_fields(config)
     add_phase_seconds(manifest, "precheck", time.perf_counter() - precheck_started)
     if args.enrich_existing:
         print("Enriching existing Feishu video records from local metadata.")
@@ -1234,7 +1307,9 @@ def main():
         print(f"Manifest: {manifest_path}")
         return
 
-    creators = load_creators(config, args.max_creators)
+    creators = resolve_selected_creators(config, args.creator_mid, args.creators_json, args.dry_run)
+    if args.max_creators:
+        creators = creators[: args.max_creators]
     existing = existing_bvids(config)
     manifest["creator_count"] = len(creators)
     print(f"Loaded {len(creators)} tracked creators, {len(existing)} existing BVIDs in Feishu.")
@@ -1267,6 +1342,20 @@ def main():
             print(f"  [video] {bvid}")
             item = {"bvid": bvid, "url": video["url"]}
             creator_result["videos"].append(item)
+            if args.dry_run:
+                candidate = {
+                    "creator": creator["name"],
+                    "mid": creator["mid"],
+                    "bvid": bvid,
+                    "url": video["url"],
+                    "would_skip_existing": bvid in existing,
+                }
+                manifest["dry_run_candidates"].append(candidate)
+                item.update(candidate)
+                item["status"] = "would_skip_existing" if bvid in existing else "candidate"
+                write_manifest(manifest_path, manifest)
+                print(f"    dry-run candidate: {bvid}")
+                continue
             if bvid in existing:
                 item["status"] = "skipped_existing"
                 manifest["skipped_existing"].append({"creator": creator["name"], "bvid": bvid})
@@ -1421,6 +1510,20 @@ def main():
                 print(f"    failed: {str(exc).splitlines()[-1] if str(exc).splitlines() else exc}")
         if args.max_total_videos and total_seen >= args.max_total_videos:
             break
+
+    if args.dry_run:
+        manifest["ended_at"] = now_str()
+        manifest["summary"] = {
+            "dry_run_candidates": len(manifest["dry_run_candidates"]),
+            "would_skip_existing": sum(1 for item in manifest["dry_run_candidates"] if item["would_skip_existing"]),
+            "failed": len(manifest["failures"]),
+            "feishu_writes": 0,
+        }
+        set_total_seconds(manifest, run_started_perf)
+        write_manifest(manifest_path, manifest)
+        print(json.dumps(manifest["summary"], ensure_ascii=False, indent=2))
+        print(f"Manifest: {manifest_path}")
+        return
 
     feishu_started = time.perf_counter()
     created_ids = batch_create_video_records(config, rows_to_create)

@@ -19,7 +19,7 @@ if hasattr(sys.stderr, "reconfigure"):
 ROOT = Path(__file__).resolve().parent
 MANIFEST_ROOT = ROOT / "downloads" / "manifests"
 TRANSCRIPT_FIELD = "视频口播稿"
-DEFAULT_PARENT_TOKEN = "SvqkwYpPxinVVgk5LPtcRqxnnke"
+DEFAULT_PARENT_POSITION = "my_library"
 
 TRANSCRIPT_FIELD_SPEC = {
     "type": "text",
@@ -52,6 +52,14 @@ def now_str():
 
 def ts_slug():
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def manifest_base_metadata(config):
+    return {
+        "base_name": config.get("base_name"),
+        "base_token_configured": bool(config.get("base_token")),
+        "video_table_id": config["tables"]["videos"]["table_id"],
+    }
 
 
 def write_json(path, payload):
@@ -398,10 +406,12 @@ def load_video_rows(config):
     return rows
 
 
-def select_rows(rows, args):
+def select_rows(rows, args, platform_video_ids=None):
     selected = []
     for row in rows:
         if args.record_id and row.get("_record_id") != args.record_id:
+            continue
+        if platform_video_ids and str(row.get("平台视频ID") or "").strip() not in platform_video_ids:
             continue
         if args.platform != "all":
             if not cell_has_platform(row.get("平台"), args.platform):
@@ -470,9 +480,26 @@ def process_row(config, row, creators_by_record_id, args):
     }
 
 
-def parse_args():
+def load_manifest_video_ids(path):
+    target = Path(path)
+    if not target.is_absolute():
+        target = ROOT / target
+    manifest = json.loads(target.read_text(encoding="utf-8"))
+    ids = {
+        str(item.get("aweme_id") or "").strip()
+        for collection in ("successes", "skipped_existing")
+        for item in manifest.get(collection, [])
+        if str(item.get("aweme_id") or "").strip()
+    }
+    if not ids:
+        raise ValueError("download manifest contains no successful or existing Douyin video IDs")
+    return ids
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Create Feishu docs for local video transcripts and write document URLs back to the video table.")
     parser.add_argument("--record-id", help="Only process one Feishu video record.")
+    parser.add_argument("--manifest", help="Only process platform video IDs from a Douyin download manifest.")
     parser.add_argument("--platform", choices=["B站", "抖音", "all"], default="all", help="Filter records by platform. Default: all.")
     parser.add_argument("--all", action="store_true", help="Process every matching historical video record. Without this, default is one record.")
     parser.add_argument("--max-records", type=int, help="Maximum records to process. Default: 1 unless --record-id is set.")
@@ -484,22 +511,21 @@ def parse_args():
     parser.add_argument("--sleep-seconds", type=float, default=7.0, help="Seconds to wait between real document creations. Default: 7.")
     parser.add_argument("--retry-attempts", type=int, default=6, help="Retry attempts for retryable lark-cli rate-limit/write errors. Default: 6.")
     parser.add_argument("--retry-delay-seconds", type=float, default=20.0, help="Initial retry delay for retryable lark-cli errors. Default: 20.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
     if not args.parent_token and not args.parent_position:
-        args.parent_token = DEFAULT_PARENT_TOKEN
+        args.parent_position = DEFAULT_PARENT_POSITION
     started_at = now_str()
     config = bili.load_config()
+    platform_video_ids = load_manifest_video_ids(args.manifest) if args.manifest else None
     manifest_path = Path(args.manifest_output) if args.manifest_output else MANIFEST_ROOT / f"{ts_slug()}-transcript-docs.json"
     manifest = {
         "started_at": started_at,
         "ended_at": None,
-        "base_name": config.get("base_name"),
-        "base_token": config.get("base_token"),
-        "video_table_id": config["tables"]["videos"]["table_id"],
+        **manifest_base_metadata(config),
         "field_name": TRANSCRIPT_FIELD,
         "field": None,
         "args": vars(args),
@@ -511,7 +537,7 @@ def main():
     try:
         manifest["field"] = ensure_transcript_field(config, dry_run=args.dry_run)
         creators_by_record_id = load_creators(config)
-        rows = select_rows(load_video_rows(config), args)
+        rows = select_rows(load_video_rows(config), args, platform_video_ids)
         if not rows:
             manifest["skipped"].append({"status": "skipped", "reason": "no_matching_records"})
             write_json(manifest_path, manifest)

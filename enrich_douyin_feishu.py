@@ -81,6 +81,10 @@ def is_empty_cell(value):
     return value is None or value == "" or value == []
 
 
+def filter_patch_for_fields(patch, available_fields):
+    return {key: value for key, value in patch.items() if key in available_fields}
+
+
 def parse_count_value(text):
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(万|亿)?", str(text or "").strip())
     if not match:
@@ -251,8 +255,17 @@ def comment_insights(comments):
     }
 
 
-def update_creator_from_video(config, video, metadata, creator_by_id, *, dry_run=False, overwrite=False):
-    links = video.get("关联博主") or []
+def update_creator_from_video(
+    config,
+    video,
+    metadata,
+    creator_by_id,
+    creator_fields,
+    *,
+    dry_run=False,
+    overwrite=False,
+):
+    links = video.get("关联博主") or video.get("博主") or []
     if not links or not isinstance(links[0], dict) or not links[0].get("id"):
         return None
     record_id = links[0]["id"]
@@ -264,6 +277,9 @@ def update_creator_from_video(config, video, metadata, creator_by_id, *, dry_run
         "粉丝数数字": stats["粉丝数数字"],
         "最近采集时间": now_str(),
     }
+    patch = filter_patch_for_fields(patch, creator_fields)
+    if not any(name in patch for name in ("粉丝数显示", "粉丝数数字")):
+        return None
     if not overwrite:
         creator = creator_by_id.get(record_id) or {}
         patch = {key: value for key, value in patch.items() if is_empty_cell(creator.get(key))}
@@ -281,7 +297,7 @@ def update_creator_from_video(config, video, metadata, creator_by_id, *, dry_run
     return {"record_id": record_id, "patch": patch}
 
 
-def enrich_video(config, video, *, dry_run=False, overwrite=False):
+def enrich_video(config, video, video_fields, *, dry_run=False, overwrite=False):
     metadata_path = Path(str(video.get("元数据文件路径") or ""))
     if not metadata_path.exists():
         raise FileNotFoundError(f"metadata not found: {metadata_path}")
@@ -309,6 +325,7 @@ def enrich_video(config, video, *, dry_run=False, overwrite=False):
         "最近采集时间": now_str(),
     }
     patch.update(comment_insights(comments))
+    patch = filter_patch_for_fields(patch, video_fields)
 
     if not overwrite:
         patch = {key: value for key, value in patch.items() if is_empty_cell(video.get(key))}
@@ -326,12 +343,13 @@ def enrich_video(config, video, *, dry_run=False, overwrite=False):
     return {"record_id": video["_record_id"], "patch": patch, "comments": len(comments)}
 
 
-def list_douyin_videos(config, aweme_id=None):
+def list_douyin_videos(config, aweme_ids=None):
     fields = [
         "视频标题",
         "平台",
         "平台视频ID",
         "关联博主",
+        "博主",
         "元数据文件路径",
         "清洗文案路径",
         "内容摘要",
@@ -349,12 +367,17 @@ def list_douyin_videos(config, aweme_id=None):
         "评论文件路径",
         "最近采集时间",
     ]
-    rows = bili.list_records(config, config["tables"]["videos"]["table_id"], fields)
+    available = bili.field_names(config, config["tables"]["videos"]["table_id"])
+    requested = [field for field in fields if field in available]
+    rows = bili.list_records(config, config["tables"]["videos"]["table_id"], requested)
+    for row in rows:
+        for field in fields:
+            row.setdefault(field, None)
     out = []
     for row in rows:
         if not select_has(row.get("平台"), "抖音"):
             continue
-        if aweme_id and str(row.get("平台视频ID") or "").strip() != aweme_id:
+        if aweme_ids and str(row.get("平台视频ID") or "").strip() not in aweme_ids:
             continue
         out.append(row)
     return out
@@ -366,25 +389,57 @@ def list_creator_records(config):
     return {row["_record_id"]: row for row in rows}
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Backfill Douyin Feishu creator/video insights from local artifacts.")
-    parser.add_argument("--aweme-id", help="Only enrich one Douyin video.")
+def validate_manifest_output(path):
+    target = Path(path)
+    if target.name.endswith("-douyin-latest-download.json"):
+        raise ValueError("refusing to overwrite a Douyin download manifest")
+    return target
+
+
+def load_manifest_aweme_ids(path):
+    target = Path(path)
+    if not target.is_absolute():
+        target = ROOT / target
+    manifest = load_json(target)
+    ids = {
+        str(item.get("aweme_id") or "").strip()
+        for collection in ("successes", "skipped_existing")
+        for item in manifest.get(collection, [])
+        if str(item.get("aweme_id") or "").strip()
+    }
+    if not ids:
+        raise ValueError("download manifest contains no successful or existing Douyin video IDs")
+    return ids
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Backfill Douyin Feishu creator/video insights from local artifacts.",
+        allow_abbrev=False,
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--aweme-id", help="Only enrich one Douyin video.")
+    scope.add_argument("--manifest", help="Only enrich successful or existing video IDs from a Douyin download manifest.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite non-empty insight fields.")
     parser.add_argument("--manifest-output", help="Write the enrichment manifest to this path.")
     parser.add_argument("--no-manifest", action="store_true", help="Do not write a manifest file.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
     config = bili.load_config()
-    videos = list_douyin_videos(config, args.aweme_id)
+    video_fields = bili.field_names(config, config["tables"]["videos"]["table_id"])
+    creator_fields = bili.field_names(config, config["tables"]["creators"]["table_id"])
+    aweme_ids = load_manifest_aweme_ids(args.manifest) if args.manifest else ({args.aweme_id} if args.aweme_id else None)
+    videos = list_douyin_videos(config, aweme_ids)
     creator_by_id = list_creator_records(config)
     result = {
         "started_at": now_str(),
         "dry_run": args.dry_run,
         "aweme_id": args.aweme_id,
+        "download_manifest": args.manifest,
         "videos": [],
         "creators": [],
         "failures": [],
@@ -397,12 +452,21 @@ def main():
                 video,
                 metadata,
                 creator_by_id,
+                creator_fields,
                 dry_run=args.dry_run,
                 overwrite=args.overwrite,
             )
             if creator_result:
                 result["creators"].append(creator_result)
-            result["videos"].append(enrich_video(config, video, dry_run=args.dry_run, overwrite=args.overwrite))
+            result["videos"].append(
+                enrich_video(
+                    config,
+                    video,
+                    video_fields,
+                    dry_run=args.dry_run,
+                    overwrite=args.overwrite,
+                )
+            )
         except Exception as exc:
             result["failures"].append(
                 {
@@ -418,7 +482,11 @@ def main():
         "failures": len(result["failures"]),
     }
     if not args.no_manifest:
-        manifest_path = Path(args.manifest_output) if args.manifest_output else MANIFEST_ROOT / f"{ts_slug()}-douyin-feishu-enrich.json"
+        manifest_path = (
+            validate_manifest_output(args.manifest_output)
+            if args.manifest_output
+            else MANIFEST_ROOT / f"{ts_slug()}-douyin-feishu-enrich.json"
+        )
         result["manifest_path"] = str(manifest_path)
         write_json(manifest_path, result)
     print(json.dumps(result, ensure_ascii=False, indent=2))

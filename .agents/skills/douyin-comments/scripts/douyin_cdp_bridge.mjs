@@ -3,30 +3,18 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { devToolsActivePortCandidates, isTargetAwemeDetail, isTargetAwemePost, networkCaptureCommands, parseJsonResponseBody, selectReusableTarget } from "./douyin_cdp_capture.mjs";
 
 const PORT = Number(process.env.DOUYIN_CDP_BRIDGE_PORT || 3457);
 
-function readDevToolsActivePort() {
-  const candidates = [];
-  if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA || "";
-    candidates.push(
-      path.join(local, "Google", "Chrome", "User Data", "DevToolsActivePort"),
-      path.join(local, "Chromium", "User Data", "DevToolsActivePort"),
-    );
-  } else if (process.platform === "darwin") {
-    const home = os.homedir();
-    candidates.push(
-      path.join(home, "Library/Application Support/Google/Chrome/DevToolsActivePort"),
-      path.join(home, "Library/Application Support/Chromium/DevToolsActivePort"),
-    );
-  } else {
-    const home = os.homedir();
-    candidates.push(
-      path.join(home, ".config/google-chrome/DevToolsActivePort"),
-      path.join(home, ".config/chromium/DevToolsActivePort"),
-    );
+async function enableFreshNetworkCapture(cdp, sessionId) {
+  for (const [method, params] of networkCaptureCommands()) {
+    await cdp.send(method, params, sessionId, 30000);
   }
+}
+
+function readDevToolsActivePort() {
+  const candidates = devToolsActivePortCandidates(process.platform, process.env, os.homedir());
   for (const file of candidates) {
     try {
       const [port, wsPath] = fs.readFileSync(file, "utf8").trim().split(/\r?\n/);
@@ -60,9 +48,14 @@ class CDP {
     this.ws = ws;
     this.nextId = 1;
     this.pending = new Map();
+    this.eventListeners = new Set();
     ws.addEventListener("message", (event) => {
       const msg = JSON.parse(event.data);
-      if (!msg.id || !this.pending.has(msg.id)) return;
+      if (!msg.id) {
+        for (const listener of this.eventListeners) listener(msg);
+        return;
+      }
+      if (!this.pending.has(msg.id)) return;
       const { resolve, reject, timer } = this.pending.get(msg.id);
       this.pending.delete(msg.id);
       clearTimeout(timer);
@@ -78,9 +71,26 @@ class CDP {
     });
   }
 
+  onEvent(listener) {
+    this.eventListeners.add(listener);
+  }
+
   static async connect() {
-    const active = readDevToolsActivePort();
-    const url = `ws://127.0.0.1:${active.port}${active.wsPath}`;
+    let active;
+    let url;
+    try {
+      active = readDevToolsActivePort();
+      url = `ws://127.0.0.1:${active.port}${active.wsPath}`;
+    } catch (fileError) {
+      const port = Number(process.env.DOUYIN_CDP_PORT || 0);
+      if (!port) throw fileError;
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+      if (!response.ok) throw new Error(`Chrome DevTools discovery failed on port ${port}: HTTP ${response.status}`);
+      const version = await response.json();
+      if (!version.webSocketDebuggerUrl) throw new Error(`Chrome DevTools on port ${port} returned no browser websocket URL`);
+      active = { port, wsPath: "", file: null };
+      url = version.webSocketDebuggerUrl;
+    }
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`WebSocket connect timed out: ${url}`)), 60000);
@@ -116,12 +126,80 @@ class CDP {
 
 let cdpInstance = null;
 let cdpPromise = null;
+const awemeCaptures = new Map();
+const awemePostCaptures = new Map();
+
+async function captureAwemeDetail(cdp, message) {
+  if (!message.sessionId) return;
+  const capture = awemeCaptures.get(message.sessionId);
+  if (!capture || capture.response) return;
+  if (message.method === "Network.responseReceived") {
+    const response = message.params?.response;
+    if (!isTargetAwemeDetail(response?.url || "", capture.awemeId)) return;
+    if (capture.requestId) return;
+    capture.requestId = message.params.requestId;
+    capture.responseInfo = { url: response.url, status: response.status, mime_type: response.mimeType };
+    return;
+  }
+  if (message.method !== "Network.loadingFinished" || capture.pending || message.params?.requestId !== capture.requestId) return;
+  capture.pending = true;
+  try {
+    const result = await cdp.send("Network.getResponseBody", { requestId: capture.requestId }, message.sessionId, 30000);
+    const body = parseJsonResponseBody(result.body || "");
+    if (body) {
+      capture.response = {
+        ...capture.responseInfo,
+        captured_at: new Date().toISOString(),
+        body,
+      };
+    }
+  } catch (error) {
+    capture.error = error.message;
+  } finally {
+    capture.pending = false;
+  }
+}
+
+async function captureAwemePost(cdp, message) {
+  if (!message.sessionId) return;
+  const capture = awemePostCaptures.get(message.sessionId);
+  if (!capture || capture.response) return;
+  if (message.method === "Network.responseReceived") {
+    const response = message.params?.response;
+    if (!isTargetAwemePost(response?.url || "", capture.secUserId)) return;
+    if (capture.requestId) return;
+    capture.requestId = message.params.requestId;
+    capture.responseInfo = { url: response.url, status: response.status, mime_type: response.mimeType };
+    return;
+  }
+  if (message.method !== "Network.loadingFinished" || capture.pending || message.params?.requestId !== capture.requestId) return;
+  capture.pending = true;
+  try {
+    const result = await cdp.send("Network.getResponseBody", { requestId: capture.requestId }, message.sessionId, 30000);
+    const body = parseJsonResponseBody(result.body || "");
+    if (body) {
+      capture.response = {
+        ...capture.responseInfo,
+        captured_at: new Date().toISOString(),
+        body,
+      };
+    }
+  } catch (error) {
+    capture.error = error.message;
+  } finally {
+    capture.pending = false;
+  }
+}
 async function getCdp() {
   if (cdpInstance?.ws.readyState === WebSocket.OPEN) return cdpInstance;
   if (!cdpPromise) {
     cdpPromise = CDP.connect()
       .then((cdp) => {
         cdpInstance = cdp;
+        cdp.onEvent((message) => {
+          void captureAwemeDetail(cdp, message);
+          void captureAwemePost(cdp, message);
+        });
         cdpPromise = null;
         return cdp;
       })
@@ -162,7 +240,55 @@ const server = http.createServer(async (req, res) => {
       }, null, 30000);
       const attached = await cdp.send("Target.attachToTarget", { targetId: created.targetId, flatten: true }, null, 30000);
       await cdp.send("Runtime.enable", {}, attached.sessionId, 30000);
+      await enableFreshNetworkCapture(cdp, attached.sessionId);
       sendJson(res, 200, { targetId: created.targetId, sessionId: attached.sessionId });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/attach") {
+      const body = await readBody(req);
+      if (!body.url) throw new Error("Missing url");
+      const cdp = await getCdp();
+      const targets = await cdp.send("Target.getTargets", {}, null, 30000);
+      const target = selectReusableTarget(targets.targetInfos, body.url);
+      if (!target) throw new Error("No matching open Chrome tab");
+      const attached = await cdp.send("Target.attachToTarget", { targetId: target.targetId, flatten: true }, null, 30000);
+      await cdp.send("Runtime.enable", {}, attached.sessionId, 30000);
+      await enableFreshNetworkCapture(cdp, attached.sessionId);
+      sendJson(res, 200, { targetId: target.targetId, sessionId: attached.sessionId, reused: true });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/aweme-detail/start") {
+      const body = await readBody(req);
+      if (!body.sessionId || !body.awemeId) throw new Error("Missing sessionId or awemeId");
+      const cdp = await getCdp();
+      await enableFreshNetworkCapture(cdp, body.sessionId);
+      awemeCaptures.set(body.sessionId, { awemeId: String(body.awemeId), response: null, responseInfo: null, requestId: null, pending: false, error: null });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/aweme-detail/read") {
+      const body = await readBody(req);
+      if (!body.sessionId) throw new Error("Missing sessionId");
+      const capture = awemeCaptures.get(body.sessionId);
+      if (!capture) throw new Error("No aweme detail capture started for session");
+      sendJson(res, 200, { ok: true, response: capture.response, pending: capture.pending, error: capture.error });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/aweme-post/start") {
+      const body = await readBody(req);
+      if (!body.sessionId || !body.secUserId) throw new Error("Missing sessionId or secUserId");
+      const cdp = await getCdp();
+      await enableFreshNetworkCapture(cdp, body.sessionId);
+      awemePostCaptures.set(body.sessionId, { secUserId: String(body.secUserId), response: null, responseInfo: null, requestId: null, pending: false, error: null });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/aweme-post/read") {
+      const body = await readBody(req);
+      if (!body.sessionId) throw new Error("Missing sessionId");
+      const capture = awemePostCaptures.get(body.sessionId);
+      if (!capture) throw new Error("No aweme post capture started for session");
+      sendJson(res, 200, { ok: true, response: capture.response, pending: capture.pending, error: capture.error });
       return;
     }
     if (req.method === "POST" && url.pathname === "/eval") {
@@ -189,6 +315,18 @@ const server = http.createServer(async (req, res) => {
       if (!body.targetId) throw new Error("Missing targetId");
       const cdp = await getCdp();
       await cdp.send("Target.closeTarget", { targetId: body.targetId }, null, 30000);
+      if (body.sessionId) awemeCaptures.delete(body.sessionId);
+      if (body.sessionId) awemePostCaptures.delete(body.sessionId);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/detach") {
+      const body = await readBody(req);
+      if (!body.sessionId) throw new Error("Missing sessionId");
+      const cdp = await getCdp();
+      await cdp.send("Target.detachFromTarget", { sessionId: body.sessionId }, null, 30000);
+      awemeCaptures.delete(body.sessionId);
+      awemePostCaptures.delete(body.sessionId);
       sendJson(res, 200, { ok: true });
       return;
     }
