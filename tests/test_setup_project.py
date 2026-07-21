@@ -32,6 +32,10 @@ class SetupProjectTests(unittest.TestCase):
         script = SETUP.read_text(encoding="utf-8")
         self.assertIn("Copy-Item -Path (Join-Path $expanded.FullName '*')", script)
 
+    def test_setup_normalizes_bootstrap_python_to_an_argument_array(self):
+        script = SETUP.read_text(encoding="utf-8")
+        self.assertIn("$bootstrap = @(Find-BootstrapPython)", script)
+
     def test_readme_documents_secure_first_run_and_manual_auth_boundaries(self):
         text = README.read_text(encoding="utf-8")
         self.assertIn("初始化项目.cmd", text)
